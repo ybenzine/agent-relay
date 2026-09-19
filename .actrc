@@ -1,0 +1,5 @@
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+--container-architecture=linux/arm64
+--network=kind
+--env=KUBECONFIG=/kube/config
+--container-options=-v=/Users/ybenzine/PycharmProjects/agent-relay/.act/kubeconfig:/kube/config:ro

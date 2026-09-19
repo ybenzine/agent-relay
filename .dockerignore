@@ -1,9 +1,9 @@
 .venv
-.ruff_cache/
+.git
+.ruff_cache
+.pytest_cache
+__pycache__
 *.db
 *.db-shm
 *.db-wal
-__pycache__/
-.pytest_cache/
 *-credentials.json
-.act/

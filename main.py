@@ -1,6 +1,6 @@
 """FastAPI routes for Agent Relay.
 
-Persistence and SQLite transaction details live in :mod:`database` and
+Persistence and PostgreSQL transaction details live in :mod:`database` and
 :mod:`storage`; the deterministic local worker is in :mod:`worker`.
 """
 

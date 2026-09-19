@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay_test   # tests refuse any database not ending in _test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      # act only: the job container is on the kind network (see .actrc), but
+      # act puts service containers on a private one. Bridge them.
+      - name: Attach Postgres service to the job network (act only)
+        if: ${{ env.ACT }}
+        run: |
+          id=$(docker ps -q --filter ancestor=postgres:17-alpine --filter status=running | head -1)
+          docker network connect --alias postgres kind "$id"
+      # Runs the starter's protocol tests and the acceptance-scenario-1
+      # integration test (both live in test_agent_relay.py).
+      - run: uv run pytest -v
+        env:
+          # Under act the job runs in a container, so the service is reached by name.
+          RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@${{ env.ACT && 'postgres' || 'localhost' }}:5432/relay_test
+
+  deploy:
+    name: Build and deploy to kind
+    needs: test          # skipped unless every test passed
+    runs-on: ubuntu-latest
+    env:
+      KIND_CLUSTER: agent-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unique per version: commit plus build time (never reused, so every
+      # run rolls out a new ReplicaSet even for an unchanged commit).
+      - name: Compute image tag
+        run: |
+          echo "IMAGE=agent-relay:${GITHUB_SHA::12}-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      # On GitHub, create a throwaway cluster. Under act (local), the job
+      # container is attached to the docker network of the existing cluster
+      # and uses its kubeconfig instead (see .actrc).
+      - name: Create kind cluster
+        if: ${{ !env.ACT }}
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+
+      - name: Install kind and kubectl (act only)
+        if: ${{ env.ACT }}
+        run: |
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          command -v kind >/dev/null || {
+            curl -fsSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-$arch"
+            chmod +x /usr/local/bin/kind
+          }
+          command -v kubectl >/dev/null || {
+            curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$arch/kubectl"
+            chmod +x /usr/local/bin/kubectl
+          }
+          kubectl get nodes
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/postgres.yaml
+          sed "s|image: agent-relay:local|image: $IMAGE|" k8s/agent-relay.yaml | kubectl apply -f -
+          kubectl -n agent-relay rollout status statefulset/postgres --timeout=180s
+          kubectl -n agent-relay rollout status deployment/agent-relay --timeout=180s
+
+      - name: Smoke test deployed API
+        run: |
+          kubectl -n agent-relay port-forward svc/agent-relay 8090:80 &
+          sleep 3
+          curl -fsS localhost:8090/ready
+          curl -fsS -X POST localhost:8090/api/v1/agents \
+            -H 'content-type: application/json' -d '{"name":"ci-smoke"}'
+
+      - name: Show cluster state on failure
+        if: failure()
+        run: |
+          kubectl -n agent-relay get pods,svc,pvc
+          kubectl -n agent-relay describe pods
+          kubectl -n agent-relay logs deployment/agent-relay --all-containers --tail=100

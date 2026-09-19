@@ -1,19 +1,24 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests against a real PostgreSQL database.
 
 These tests intentionally exercise storage calls from multiple threads: that
 is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
+inbox.  The guarantee comes from PostgreSQL row locks (FOR UPDATE SKIP LOCKED),
 not from a Python lock.
+
+Start a database with ``docker compose up -d postgres`` and create the scratch
+database once: ``docker compose exec postgres createdb -U relay relay_test``.
 """
 
 from __future__ import annotations
 
 import os
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Default to a scratch database so `pytest` never resets the dev database.
+# An explicit RELAY_DATABASE_URL is respected, but the fixture below drops every
+# table, so it refuses any database whose name doesn't end in `_test`.
+os.environ.setdefault(
+    "RELAY_DATABASE_URL", "postgresql+psycopg://relay:relay@localhost:5432/relay_test"
+)
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -28,8 +33,10 @@ from storage import claim_one
 
 @pytest.fixture(autouse=True)
 def empty_database():
-    # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # Drops all tables, so only ever run against a scratch database.
+    assert (engine.url.database or "").endswith("_test"), (
+        f"refusing to reset non-test database {engine.url.database!r}"
+    )
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -98,7 +105,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_postgres_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")
@@ -156,7 +163,64 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
     with TestClient(main.app) as client:
         page = client.get("/")
         assert page.status_code == 200
+        assert "<h1>Agent Relay v2</h1>" in page.text
         assert "sessionStorage" in page.text
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def test_acceptance_scenario_1_send_claim_complete_read():
+    """SPEC acceptance scenario 1, through the real API and database."""
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice")
+        recipient, recipient_headers = register(client, "bob")
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers={**sender_headers, "Idempotency-Key": "k1"},
+            json={"to": recipient["agent_id"], "input": "hello relay"},
+        )
+        assert sent.status_code == 201
+        assert sent.json()["status"] == "queued"
+        task_id = sent.json()["task_id"]
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "w1", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claimed = claim.json()
+        assert claimed["task_id"] == task_id
+        assert claimed["from"] == sender["agent_id"]
+        assert claimed["input"] == "hello relay"
+        assert claimed["attempt"] == 1
+
+        completed = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claimed["claim_token"], "output": "HELLO RELAY"},
+        )
+        assert completed.status_code == 200
+        assert completed.json() == {"task_id": task_id, "status": "completed"}
+
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers)
+        assert result.status_code == 200
+        body = result.json()
+        assert body["status"] == "completed"
+        assert body["output"] == "HELLO RELAY"
+        assert body["error"] is None
+        assert body["from"] == sender["agent_id"]
+        assert body["to"] == recipient["agent_id"]
+        assert body["attempt_count"] == 1
+        assert body["finished_at"] is not None
+
+        # Verify persisted state directly in the database.
+        with db_session() as db:
+            task = db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.output == "HELLO RELAY"
+            attempts = db.query(Attempt).filter(Attempt.task_id == task_id).all()
+            assert len(attempts) == 1
+            assert attempts[0].outcome == "completed"
